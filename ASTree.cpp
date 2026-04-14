@@ -346,6 +346,47 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 stack.push(new ASTSet(values));
             }
             break;
+        case Pyc::BUILD_TUPLE_UNPACK_A:
+        case Pyc::BUILD_TUPLE_UNPACK_WITH_CALL_A:
+            {
+                // Merge N iterables into one tuple: (*a, *b, *c)
+                ASTTuple::value_t values;
+                values.resize(operand);
+                for (int i = 0; i < operand; i++) {
+                    values[operand - i - 1] = new ASTUnary(stack.top(), ASTUnary::UN_UNPACK);
+                    stack.pop();
+                }
+                stack.push(new ASTTuple(values));
+            }
+            break;
+        case Pyc::BUILD_LIST_UNPACK_A:
+            {
+                ASTList::value_t values;
+                for (int i = 0; i < operand; i++) {
+                    values.push_front(new ASTUnary(stack.top(), ASTUnary::UN_UNPACK));
+                    stack.pop();
+                }
+                stack.push(new ASTList(values));
+            }
+            break;
+        case Pyc::BUILD_MAP_UNPACK_A:
+        case Pyc::BUILD_MAP_UNPACK_WITH_CALL_A:
+            {
+                // Merge N dicts: {**a, **b}
+                // Collect in reverse order first, then add in correct order
+                std::vector<PycRef<ASTNode>> items(operand);
+                for (int i = operand - 1; i >= 0; i--) {
+                    items[i] = stack.top();
+                    stack.pop();
+                }
+                PycRef<ASTMap> map = new ASTMap();
+                for (int i = 0; i < operand; i++) {
+                    // nullptr key signals **unpack in print_map
+                    map->add(nullptr, items[i]);
+                }
+                stack.push(map.cast<ASTNode>());
+            }
+            break;
         case Pyc::BUILD_MAP_A:
             if (mod->verCompare(3, 5) >= 0) {
                 auto map = new ASTMap;
@@ -689,6 +730,31 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 PycRef<ASTNode> call = new ASTCall(func, pparamList, kwparamList);
                 call.cast<ASTCall>()->setKW(kw);
                 call.cast<ASTCall>()->setVar(var);
+                stack.push(call);
+            }
+            break;
+        case Pyc::CALL_FUNCTION_EX_A:
+        case Pyc::INSTRUMENTED_CALL_FUNCTION_EX_A:
+            {
+                // Python 3.6+: CALL_FUNCTION_EX flag
+                // flag & 0x01: TOS = kwargs_dict, TOS1 = args_tuple, TOS2 = callable
+                // flag == 0:   TOS = args_tuple, TOS1 = callable
+                PycRef<ASTNode> kwvar, var;
+                if (operand & 0x01) {
+                    kwvar = stack.top();
+                    stack.pop();
+                }
+                var = stack.top();
+                stack.pop();
+                PycRef<ASTNode> func = stack.top();
+                stack.pop();
+
+                ASTCall::pparam_t pparamList;
+                ASTCall::kwparam_t kwparamList;
+                PycRef<ASTNode> call = new ASTCall(func, pparamList, kwparamList);
+                call.cast<ASTCall>()->setVar(var);
+                if (kwvar != nullptr)
+                    call.cast<ASTCall>()->setKW(kwvar);
                 stack.push(call);
             }
             break;
@@ -3079,9 +3145,15 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 else
                     pyc_output << ",\n";
                 start_line(cur_indent, pyc_output);
-                print_src(val.first, mod, pyc_output);
-                pyc_output << ": ";
-                print_src(val.second, mod, pyc_output);
+                if (val.first == nullptr) {
+                    // **unpack entry
+                    pyc_output << "**";
+                    print_src(val.second, mod, pyc_output);
+                } else {
+                    print_src(val.first, mod, pyc_output);
+                    pyc_output << ": ";
+                    print_src(val.second, mod, pyc_output);
+                }
                 first = false;
             }
             cur_indent--;
