@@ -2,7 +2,24 @@
 #include <cstdint>
 #include <stdexcept>
 #include <unordered_set>
+#include <csignal>
+#include <csetjmp>
 #include "ASTree.h"
+
+// Signal-safe recovery from crashes (SIGSEGV/SIGBUS/SIGABRT) during decompilation.
+// When BuildFromCode hits garbled bytecode that causes a segfault, we longjmp back
+// to the decompyle() call site and emit an error comment instead of crashing.
+static thread_local sigjmp_buf s_jmpbuf;
+static thread_local volatile sig_atomic_t s_recovering = 0;
+
+static void crash_handler(int sig) {
+    if (s_recovering) {
+        siglongjmp(s_jmpbuf, sig);
+    }
+    // Not in recovery mode — re-raise for default behavior
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
 #include "FastStack.h"
 #include "pyc_numeric.h"
 #include "bytecode.h"
@@ -3663,7 +3680,87 @@ void decompyle(PycRef<PycCode> code, PycModule* mod, std::ostream& pyc_output)
     }
     code_seen.insert((PycCode *)code);
 
-    PycRef<ASTNode> source = BuildFromCode(code, mod);
+    // Pre-scan bytecode for validity. Garbled/encrypted bytecode with many
+    // invalid opcodes can cause crashes (segfaults) in BuildFromCode.
+    {
+        PycRef<PycString> codeStr = code->code();
+        const unsigned char* raw = (const unsigned char*)codeStr->value();
+        int codeLen = codeStr->length();
+        if (codeLen >= 10) {
+            int step = (mod->verCompare(3, 6) >= 0) ? 2 : 1;
+            int invalid = 0, total = 0;
+            for (int i = 0; i < codeLen; i += step) {
+                int mapped = Pyc::ByteToOpcode(mod->majorVer(), mod->minorVer(), raw[i]);
+                if (mapped == Pyc::PYC_INVALID_OPCODE)
+                    invalid++;
+                total++;
+            }
+            if (invalid > total / 5) {
+                fprintf(stderr, "Skipping %s: garbled bytecode (%d/%d invalid opcodes)\n",
+                        code->name()->value(), invalid, total);
+                start_line(cur_indent + 1, pyc_output);
+                pyc_output << "# ERROR: garbled bytecode (" << invalid << "/" << total << " invalid opcodes)\n";
+                start_line(cur_indent + 1, pyc_output);
+                pyc_output << "pass\n";
+                code_seen.erase((PycCode *)code);
+                return;
+            }
+        }
+    }
+
+    PycRef<ASTNode> source;
+
+    // Install crash handlers for recovery from garbled bytecode
+    struct sigaction sa_segv_old, sa_bus_old, sa_abrt_old;
+    struct sigaction sa_new = {};
+    sa_new.sa_handler = crash_handler;
+    sa_new.sa_flags = 0;
+    sigemptyset(&sa_new.sa_mask);
+    sigaction(SIGSEGV, &sa_new, &sa_segv_old);
+    sigaction(SIGBUS, &sa_new, &sa_bus_old);
+    sigaction(SIGABRT, &sa_new, &sa_abrt_old);
+    s_recovering = 1;
+
+    int crash_sig = sigsetjmp(s_jmpbuf, 1);
+    if (crash_sig != 0) {
+        // Recovered from a crash
+        s_recovering = 0;
+        sigaction(SIGSEGV, &sa_segv_old, nullptr);
+        sigaction(SIGBUS, &sa_bus_old, nullptr);
+        sigaction(SIGABRT, &sa_abrt_old, nullptr);
+        const char* signame = (crash_sig == SIGSEGV) ? "SIGSEGV" :
+                              (crash_sig == SIGBUS) ? "SIGBUS" : "SIGABRT";
+        fprintf(stderr, "Crash in %s: %s (recovered)\n",
+                code->name()->value(), signame);
+        start_line(cur_indent + 1, pyc_output);
+        pyc_output << "# ERROR: decompilation crashed (" << signame << ")\n";
+        start_line(cur_indent + 1, pyc_output);
+        pyc_output << "pass\n";
+        code_seen.erase((PycCode *)code);
+        return;
+    }
+
+    try {
+        source = BuildFromCode(code, mod);
+    } catch (std::exception& ex) {
+        s_recovering = 0;
+        sigaction(SIGSEGV, &sa_segv_old, nullptr);
+        sigaction(SIGBUS, &sa_bus_old, nullptr);
+        sigaction(SIGABRT, &sa_abrt_old, nullptr);
+        fprintf(stderr, "Error decompyling %s: %s\n",
+                code->name()->value(), ex.what());
+        start_line(cur_indent + 1, pyc_output);
+        pyc_output << "# ERROR: failed to decompile (" << ex.what() << ")\n";
+        start_line(cur_indent + 1, pyc_output);
+        pyc_output << "pass\n";
+        code_seen.erase((PycCode *)code);
+        return;
+    }
+
+    s_recovering = 0;
+    sigaction(SIGSEGV, &sa_segv_old, nullptr);
+    sigaction(SIGBUS, &sa_bus_old, nullptr);
+    sigaction(SIGABRT, &sa_abrt_old, nullptr);
 
     PycRef<ASTNodeList> clean = source.cast<ASTNodeList>();
     if (cleanBuild) {
