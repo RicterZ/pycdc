@@ -1476,6 +1476,14 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                     break;
                 }
 
+                /* If the current block is BLK_MAIN, JUMP_FORWARD should be
+                   a no-op.  This can happen when RAISE_VARARGS already closed
+                   an enclosing IF block and we're back at the main level --
+                   popping BLK_MAIN would leave the blocks stack empty and
+                   cause a crash later. */
+                if (curblock->blktype() == ASTBlock::BLK_MAIN)
+                    break;
+
                 if (!stack_hist.empty()) {
                     if (stack.empty()) // if it's part of if-expression, TOS at the moment is the result of "if" part
                         stack = stack_hist.top();
